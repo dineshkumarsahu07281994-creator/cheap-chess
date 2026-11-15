@@ -1,7 +1,7 @@
 # CheapChess
 
-Online chess against a random opponent that costs nothing to run. The whole site is four static
-files: host them anywhere free and there is no server, database, or bill.
+Online chess against a random opponent that costs nothing to run. The whole site is a handful
+of static files: host them anywhere free and there is no server, database, or bill.
 
 Play: <https://dineshkumarsahu07281994-creator.github.io/cheap-chess/>
 
@@ -46,6 +46,7 @@ Netlify: drag the folder onto <https://app.netlify.com/drop>.
 |---|---|
 | Time control, first-move limit, lag allowance | constants at the top of `js/app.js` |
 | Separate queue for a club or classroom | `?lobby=<name>` in the URL |
+| TURN relay for strict networks | `CHEAPCHESS_TURN_CREDENTIALS_URL` in `config.js` |
 | Own PeerJS broker | set `window.CHEAPCHESS_PEER_SERVER = { host, port, path, secure }` before `js/app.js` loads |
 
 ## Limitations of a server-free design
@@ -53,8 +54,9 @@ Netlify: drag the folder onto <https://app.netlify.com/drop>.
 - The public broker is shared and best-effort. Anyone can claim the lobby ID `cheapchess-v1-main`; if
   that becomes a problem, pick a different lobby name or run [PeerServer](https://github.com/peers/peerjs-server)
   on a free tier.
-- Players on very strict networks (some corporate or mobile carriers) need a TURN relay. PeerJS
-  ships with free public TURN servers, but they carry no uptime guarantee.
+- Players on strict networks (many mobile carriers, offices) need a TURN relay to connect. PeerJS
+  [no longer runs its free TURN servers](https://github.com/orgs/peers/discussions/1172), so add your
+  own in `config.js` (Metered's free tier gives 20 GB/month).
 - Each player's browser is the referee, so engine use can't be detected and a modified client could
   misreport its own clock (capped at a 3-second lag allowance).
 - No accounts, ratings, or saved games.
