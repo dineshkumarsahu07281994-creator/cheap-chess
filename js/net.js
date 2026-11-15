@@ -11,8 +11,17 @@ export const PROTOCOL_VERSION = 1;
 const HANDSHAKE_MS = 10_000;
 const MAX_FAILED_ATTEMPTS = 15;
 
-// Set window.CHEAPCHESS_PEER_SERVER = { host, port, path, secure } to use your own broker.
-const PEER_OPTIONS = { debug: 0, ...(window.CHEAPCHESS_PEER_SERVER || {}) };
+// A host whose guests keep failing to connect is probably unreachable itself. It gives the
+// slot up for a while so that a reachable player can host instead of everyone stalling on it.
+const MAX_HOST_FAILURES = 2;
+const HOST_BACKOFF_MS = 10_000;
+const WARN_AFTER_FAILURES = 2;
+const NETWORK_WARNING = 'Opponents were found but the connection failed. Your network may block direct play.';
+
+const STUN_SERVERS = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
 
 export function lobbyId() {
   // ?lobby=xyz gives a separate queue, e.g. for testing or for a club playing among itself.
@@ -21,23 +30,49 @@ export function lobbyId() {
   return `cheapchess-v${PROTOCOL_VERSION}-${room.toLowerCase()}`;
 }
 
+// STUN only finds a direct route. Players behind strict NATs also need a TURN relay, which
+// comes from window.CHEAPCHESS_TURN_CREDENTIALS_URL (see config.js).
+async function iceServers() {
+  const url = window.CHEAPCHESS_TURN_CREDENTIALS_URL;
+  if (!url) return STUN_SERVERS;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const body = await res.json();
+    const turn = Array.isArray(body) ? body : body.iceServers;
+    if (res.ok && Array.isArray(turn)) return [...STUN_SERVERS, ...turn];
+    console.warn('CheapChess: TURN credentials response had no ice servers', res.status, body);
+  } catch (err) {
+    console.warn('CheapChess: could not fetch TURN credentials; direct connections only', err);
+  }
+  return STUN_SERVERS;
+}
+
 /**
  * Resolves with { peer, conn, color, opponentName } once paired. `color` is this player's
  * colour ('w' or 'b'). The caller owns `peer` and `conn` afterwards and must destroy them.
  */
-export function findOpponent({ name, onStatus = () => {}, signal }) {
-  return new Promise((resolve, reject) => {
-    const Peer = window.Peer;
-    if (!Peer) {
-      reject(new Error('Could not load the networking library. Check your connection and reload.'));
-      return;
-    }
+export async function findOpponent({ name, onStatus = () => {}, signal }) {
+  const Peer = window.Peer;
+  if (!Peer) throw new Error('Could not load the networking library. Check your connection and reload.');
 
+  onStatus('Looking for an opponent…');
+  // Set window.CHEAPCHESS_PEER_SERVER = { host, port, path, secure } to use your own broker.
+  const peerOptions = {
+    debug: 0,
+    config: { iceServers: await iceServers() },
+    ...(window.CHEAPCHESS_PEER_SERVER || {}),
+  };
+  if (signal?.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+  return new Promise((resolve, reject) => {
     let peer = null;
     let settled = false;
     let failures = 0;
+    let hostFailures = 0;
+    let connectFailures = 0; // handshakes that started but never completed, as host or guest
     const timers = new Set();
 
+    const status = (text) => onStatus(connectFailures >= WARN_AFTER_FAILURES ? `${text} ${NETWORK_WARNING}` : text);
     const later = (fn, ms) => {
       const id = setTimeout(() => { timers.delete(id); fn(); }, ms);
       timers.add(id);
@@ -67,25 +102,25 @@ export function findOpponent({ name, onStatus = () => {}, signal }) {
       dropPeer();
       reject(err);
     };
-    const retry = (counts = true) => {
+    const retry = (counts = true, delay = 300 + Math.random() * 900) => {
       if (settled) return;
       dropPeer();
       if (counts && ++failures > MAX_FAILED_ATTEMPTS) {
         fail(new Error('Could not reach the matchmaking service. Check your connection and try again.'));
         return;
       }
-      later(tryHost, 300 + Math.random() * 900);
+      later(tryHost, delay);
     };
 
     signal?.addEventListener('abort', () => fail(new DOMException('Cancelled', 'AbortError')));
 
     function tryHost() {
       if (settled) return;
-      onStatus('Looking for an opponent…');
-      const me = (peer = new Peer(lobbyId(), PEER_OPTIONS));
+      status('Looking for an opponent…');
+      const me = (peer = new Peer(lobbyId(), peerOptions));
       let busy = false; // a guest is mid-handshake
 
-      me.on('open', () => onStatus('Waiting for an opponent…'));
+      me.on('open', () => status('Waiting for an opponent…'));
 
       me.on('connection', (conn) => {
         if (settled || busy) {
@@ -96,19 +131,33 @@ export function findOpponent({ name, onStatus = () => {}, signal }) {
           return;
         }
         busy = true;
-        const release = () => {
+        let ended = false;
+        const handshakeFailed = () => {
+          if (ended || settled || me !== peer) return;
+          ended = true;
+          cancelTimer(timeout);
           busy = false;
           conn.removeAllListeners();
           conn.close();
+          connectFailures++;
+          if (++hostFailures >= MAX_HOST_FAILURES) {
+            hostFailures = 0;
+            retry(false, HOST_BACKOFF_MS + Math.random() * 5000);
+          } else {
+            status('Waiting for an opponent…');
+          }
         };
-        const timeout = later(release, HANDSHAKE_MS);
+        const timeout = later(handshakeFailed, HANDSHAKE_MS);
 
         conn.on('data', (msg) => {
-          if (!msg || msg.t !== 'hello' || settled) return;
+          if (!msg || msg.t !== 'hello' || settled || ended) return;
+          ended = true;
           cancelTimer(timeout);
           if (msg.v !== PROTOCOL_VERSION) {
             conn.send({ t: 'busy' });
-            release();
+            busy = false;
+            conn.removeAllListeners();
+            setTimeout(() => conn.close(), 500);
             return;
           }
           const color = Math.random() < 0.5 ? 'w' : 'b';
@@ -116,8 +165,8 @@ export function findOpponent({ name, onStatus = () => {}, signal }) {
           conn.removeAllListeners();
           succeed({ peer: me, conn, color, opponentName: msg.name });
         });
-        conn.on('close', () => { if (!settled) { cancelTimer(timeout); busy = false; } });
-        conn.on('error', () => { if (!settled) { cancelTimer(timeout); release(); } });
+        conn.on('close', handshakeFailed);
+        conn.on('error', handshakeFailed);
       });
 
       me.on('disconnected', () => { if (!settled && me === peer) retry(); });
@@ -135,13 +184,19 @@ export function findOpponent({ name, onStatus = () => {}, signal }) {
 
     function tryJoin() {
       if (settled) return;
-      onStatus('Opponent found, connecting…');
-      const me = (peer = new Peer(PEER_OPTIONS));
+      status('Opponent found, connecting…');
+      const me = (peer = new Peer(peerOptions));
       let timeout = null;
+      const handshakeFailed = () => {
+        if (settled || me !== peer) return;
+        cancelTimer(timeout);
+        connectFailures++;
+        retry(false);
+      };
 
       me.on('open', () => {
         const conn = me.connect(lobbyId(), { reliable: true, serialization: 'json' });
-        timeout = later(() => retry(false), HANDSHAKE_MS);
+        timeout = later(handshakeFailed, HANDSHAKE_MS);
 
         conn.on('open', () => conn.send({ t: 'hello', v: PROTOCOL_VERSION, name }));
         conn.on('data', (msg) => {
@@ -155,7 +210,7 @@ export function findOpponent({ name, onStatus = () => {}, signal }) {
             succeed({ peer: me, conn, color: msg.color, opponentName: msg.name });
           }
         });
-        conn.on('close', () => { if (!settled && me === peer) { cancelTimer(timeout); retry(false); } });
+        conn.on('close', handshakeFailed);
       });
 
       me.on('error', (err) => {
