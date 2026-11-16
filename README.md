@@ -17,6 +17,9 @@ Play: <https://dineshkumarsahu07281994-creator.github.io/cheap-chess/>
 Both browsers run the full rules, so each one checks every move the other sends. An illegal or
 out-of-turn move ends the game as a win for the honest side.
 
+Diagrams of the system, matchmaking, how moves are checked, the game states and the code layout
+are in [docs/architecture.md](docs/architecture.md).
+
 Features: 10-minute clocks, a 30-second first-move abort, legal-move dots, promotion picker, check and
 last-move highlights, draw offers, two-click resign, rematch with colours swapped, abandonment
 detection, and a "Your move" tab title when the page is in the background.
